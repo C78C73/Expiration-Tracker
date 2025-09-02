@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Food Tracker</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>🍖 Food Expiration Tracker</h1>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <ul class="flashes">
+              {% for category, message in messages %}
+                <li class="{{ category }}">{{ message }}</li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        {% endwith %}
+        <form method="POST">
+            <input type="text" name="name" placeholder="Food Name" required>
+            <input type="date" name="exp" required>
+            <button type="submit">Add Food</button>
+        </form>
+
+        <h2>Current Food Items</h2>
+        <table class="food-table">
+            <thead>
+                <tr><th>Food</th><th>Date</th><th>Action</th></tr>
+            </thead>
+            <tbody>
+            {% for food in food_list %}
+                <tr>
+                    <td>{{ food.name }}</td>
+                    <td>{{ food.exp }}</td>
+                    <td>
+                        <form method="POST" action="{{ url_for('delete_food', name=food.name) }}" style="display:inline;">
+                            <button type="submit" onclick="return confirm('Delete {{ food.name }}?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
