@@ -1,50 +1,44 @@
 from flask import Flask, request, render_template, redirect, url_for, flash
+
 import os
 from dotenv import load_dotenv
 from datetime import datetime
 import smtplib
 from email.message import EmailMessage
-import json
+import psycopg2
 import threading
 import time
+
 
 
 load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev")
 
+# Database connection
+def get_db():
+    db_url = os.environ.get("DATABASE_URL")
+    return psycopg2.connect(db_url)
 
-food_file = "food_data.json"
-log_file = "food_log.json"
+# Initialize table
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS food (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL,
+                    exp DATE NOT NULL,
+                    notified BOOLEAN DEFAULT FALSE
+                )
+            """)
+            conn.commit()
+init_db()
 
+# Helper: log actions (optional, can be expanded to a table)
 def log_action(action, name, exp=None):
-    log_entry = {
-        "action": action,
-        "name": name,
-        "exp": exp,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    try:
-        with open(log_file, "r") as f:
-            logs = json.load(f)
-    except:
-        logs = []
-    logs.append(log_entry)
-    with open(log_file, "w") as f:
-        json.dump(logs, f, indent=2)
+    print(f"LOG: {action} {name} {exp} at {datetime.now()}")
 
-try:
-    with open(food_file, "r") as f:
-        food_list = json.load(f)
-except:
-    food_list = []
-
-# Save food list to JSON
-def save_food():
-    with open(food_file, "w") as f:
-        json.dump(food_list, f)
-
-# Send email reminder
 def send_email(food_name, exp_date, added=False, deleted=False):
     sender_email = os.environ.get("EMAIL_USER")
     sender_pass = os.environ.get("EMAIL_PASS")
@@ -84,39 +78,41 @@ def send_email(food_name, exp_date, added=False, deleted=False):
     except Exception as e:
         print("Failed to send email:", e)
 
-# Check expirations
-def check_expirations():
-    today = datetime.now()
-    for food in food_list:
-        exp_date = datetime.strptime(food["exp"], "%Y-%m-%d")
-        if 0 <= (exp_date - today).days <= 3 and not food.get("notified"):
-            send_email(food["name"], food["exp"])
-            food["notified"] = True
-    save_food()
 
-# Background thread
+def check_expirations():
+    today = datetime.now().date()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name, exp, notified FROM food")
+            for name, exp, notified in cur.fetchall():
+                if exp and 0 <= (exp - today).days <= 3 and not notified:
+                    send_email(name, exp.strftime("%Y-%m-%d"))
+                    cur.execute("UPDATE food SET notified=TRUE WHERE name=%s", (name,))
+            conn.commit()
+
+
 def background_checker():
     while True:
         check_expirations()
-        time.sleep(3600)  # check every hour
+        time.sleep(3600)
 
 # Web routes
 
-# Delete food route
+
 @app.route("/delete/<name>", methods=["POST"])
 def delete_food(name):
-    global food_list
-    deleted_item = None
-    for f in food_list:
-        if f["name"].lower() == name.lower():
-            deleted_item = f
-            break
-    food_list = [f for f in food_list if f["name"].lower() != name.lower()]
-    save_food()
-    log_action("delete", name, deleted_item["exp"] if deleted_item else None)
-    send_email(name, deleted_item["exp"] if deleted_item else None, deleted=True)
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT exp FROM food WHERE name=%s", (name,))
+            row = cur.fetchone()
+            exp = row[0].strftime("%Y-%m-%d") if row else None
+            cur.execute("DELETE FROM food WHERE name=%s", (name,))
+            conn.commit()
+    log_action("delete", name, exp)
+    send_email(name, exp, deleted=True)
     flash(f"Deleted {name}", "info")
     return redirect(url_for("index"))
+
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -124,25 +120,31 @@ def index():
         name = request.form["name"].strip()
         exp = request.form["exp"]
         # Check for duplicate
-        if any(f["name"].lower() == name.lower() for f in food_list):
-            flash(f"Food '{name}' already exists!", "warning")
-        else:
-            food_list.append({"name": name, "exp": exp})
-            save_food()
-            log_action("add", name, exp)
-            send_email(name, exp, added=True)
-            flash(f"Added {name}", "success")
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM food WHERE LOWER(name)=%s", (name.lower(),))
+                if cur.fetchone():
+                    flash(f"Food '{name}' already exists!", "warning")
+                else:
+                    cur.execute("INSERT INTO food (name, exp) VALUES (%s, %s)", (name, exp))
+                    conn.commit()
+                    log_action("add", name, exp)
+                    send_email(name, exp, added=True)
+                    flash(f"Added {name}", "success")
         return redirect(url_for("index"))
     # Format dates for display
     display_list = []
-    for food in food_list:
-        try:
-            dt = datetime.strptime(food["exp"], "%Y-%m-%d")
-            exp_fmt = dt.strftime("%-m/%-d/%Y") if os.name != "nt" else dt.strftime("%#m/%#d/%Y")
-        except Exception:
-            exp_fmt = food["exp"]
-        display_list.append({"name": food["name"], "exp": exp_fmt})
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name, exp FROM food ORDER BY exp ASC")
+            for name, exp in cur.fetchall():
+                try:
+                    exp_fmt = exp.strftime("%-m/%-d/%Y") if os.name != "nt" else exp.strftime("%#m/%#d/%Y")
+                except Exception:
+                    exp_fmt = str(exp)
+                display_list.append({"name": name, "exp": exp_fmt})
     return render_template("index.html", food_list=display_list)
+
 
 # Start background thread
 threading.Thread(target=background_checker, daemon=True).start()
